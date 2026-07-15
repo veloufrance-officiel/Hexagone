@@ -28,7 +28,7 @@ export class SceneManager {
     this.objects = new Map();
     this.objectCount = 0;
 
-    this.world = new World();
+    this.world = new World(this.scene);
     this.world.load();
   }
 
