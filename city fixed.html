@@ -1,0 +1,712 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <style>
+        body { margin:0; overflow:hidden; background:#222; touch-action:none; font-family:sans-serif; }
+        .btn { position:absolute; width:70px; height:70px; border-radius:50%; background:rgba(255,255,255,0.14); color:white; display:flex; align-items:center; justify-content:center; font-weight:bold; font-size:20px; border:2px solid rgba(255,255,255,0.4); user-select:none; -webkit-tap-highlight-color:transparent; touch-action:none; }
+        .btn.active { background:rgba(255,255,255,0.42); }
+        #tri { right:110px; bottom:170px; } #carre { right:180px; bottom:100px; }
+        #rond { right:40px; bottom:100px; } #croix { right:110px; bottom:30px; }
+        #hint { position:absolute; left:12px; bottom:12px; color:rgba(255,255,255,0.65); font-size:11px; max-width:220px; line-height:1.5; }
+        #hud { position:absolute; left:12px; top:12px; background:rgba(10,12,16,0.6); color:#f2c94c; padding:5px 12px; border-radius:6px; font-size:15px; }
+        #prompt { position:absolute; left:50%; top:20px; transform:translateX(-50%); background:rgba(10,12,16,0.78); color:#fff; padding:6px 14px; border-radius:6px; font-size:13px; display:none; white-space:nowrap; }
+
+        #driveJoyBase {
+            position:absolute; left:24px; bottom:30px; width:132px; height:132px;
+            border-radius:50%; background:rgba(255,255,255,0.08); border:2px solid rgba(255,255,255,0.3);
+            touch-action:none;
+        }
+        #driveJoyStick {
+            position:absolute; left:50%; top:50%; width:56px; height:56px;
+            margin-left:-28px; margin-top:-28px; border-radius:50%;
+            background:rgba(111,178,255,0.5); border:2px solid rgba(111,178,255,0.9);
+        }
+    </style>
+</head>
+<body>
+    <div id="hud">€ <span id="moneyval">0</span></div>
+    <div id="prompt"></div>
+    <div id="driveJoyBase"><div id="driveJoyStick"></div></div>
+    <div id="tri" class="btn">▲</div>
+    <div id="carre" class="btn">■</div>
+    <div id="rond" class="btn">●</div>
+    <div id="croix" class="btn">✖</div>
+    <div id="hint">Joystick — déplacement · ▲ sauter · ■ interagir · ● frapper · ✖ monter en véhicule</div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script>
+        const scene = new THREE.Scene();
+        const HORIZON_COLOR = 0xcfe6ff;
+        scene.fog = new THREE.Fog(HORIZON_COLOR, 70, 230);
+        const camera = new THREE.PerspectiveCamera(70, window.innerWidth/window.innerHeight, 0.1, 1000);
+        const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.outputEncoding = THREE.sRGBEncoding;
+        renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        renderer.toneMappingExposure = 1.1;
+        document.body.appendChild(renderer.domElement);
+        const clock = new THREE.Clock();
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth/window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        function rand(a,b){ return a + Math.random()*(b-a); }
+
+        // ============================================================
+        // CIEL DÉGRADÉ
+        // ============================================================
+        function createSky() {
+            const sunDir = new THREE.Vector3(40, 60, 20).normalize();
+            const mat = new THREE.ShaderMaterial({
+                uniforms: {
+                    topColor: { value: new THREE.Color(0x1e57a8) },
+                    bottomColor: { value: new THREE.Color(HORIZON_COLOR) },
+                    sunPosition: { value: sunDir }
+                },
+                vertexShader: `varying vec3 vPos; void main(){ vec4 wp = modelMatrix*vec4(position,1.0); vPos = wp.xyz; gl_Position = projectionMatrix*viewMatrix*wp; }`,
+                fragmentShader: `
+                    uniform vec3 topColor; uniform vec3 bottomColor; uniform vec3 sunPosition;
+                    varying vec3 vPos;
+                    void main(){
+                        float h = normalize(vPos + vec3(0.0,12.0,0.0)).y;
+                        vec3 sky = mix(bottomColor, topColor, max(pow(max(h,0.0),0.55),0.0));
+                        float sunAmt = max(dot(normalize(vPos), normalize(sunPosition)), 0.0);
+                        sky += vec3(1.0,0.95,0.85) * pow(sunAmt, 600.0) * 1.3;
+                        sky += vec3(1.0,0.9,0.7) * pow(sunAmt, 8.0) * 0.2;
+                        gl_FragColor = vec4(sky, 1.0);
+                    }`,
+                side: THREE.BackSide,
+                depthWrite: false
+            });
+            scene.add(new THREE.Mesh(new THREE.SphereGeometry(400, 20, 14), mat));
+        }
+        createSky();
+
+        scene.add(new THREE.AmbientLight(0xffffff, 0.4));
+        scene.add(new THREE.HemisphereLight(0xbcd6ff, 0x4a4536, 0.5));
+        const sun = new THREE.DirectionalLight(0xfff4e0, 0.85);
+        sun.position.set(40, 60, 20);
+        scene.add(sun);
+
+        const ground = new THREE.Mesh(
+            new THREE.PlaneGeometry(400, 400),
+            new THREE.MeshLambertMaterial({ color: 0x3a3f33 })
+        );
+        ground.rotation.x = -Math.PI/2;
+        scene.add(ground);
+
+        // ============================================================
+        // OMBRES "BLOB" (coût quasi nul, pas de shadow map)
+        // ============================================================
+        const blobGeo = new THREE.CircleGeometry(1, 10);
+        const blobMat = new THREE.MeshBasicMaterial({ color:0x000000, transparent:true, opacity:0.3, depthWrite:false });
+        function addBlobShadow(root, radius) {
+            const s = new THREE.Mesh(blobGeo, blobMat);
+            s.rotation.x = -Math.PI/2;
+            s.scale.set(radius, radius, 1);
+            s.position.y = 0.015;
+            root.add(s);
+        }
+
+        // ============================================================
+        // TEXTURE DE FENÊTRES (canvas généré une fois, aucun chargement réseau)
+        // ============================================================
+        function makeWindowTexture() {
+            const c = document.createElement('canvas');
+            c.width = 64; c.height = 128;
+            const ctx = c.getContext('2d');
+            ctx.fillStyle = '#20242b';
+            ctx.fillRect(0,0,64,128);
+            const cols=4, rows=9, cw=64/cols, rh=128/rows;
+            for (let r=0;r<rows;r++) for (let cI=0;cI<cols;cI++) {
+                ctx.fillStyle = Math.random()<0.3 ? 'rgba(255,222,150,0.95)' : 'rgba(60,70,88,0.6)';
+                ctx.fillRect(cI*cw+3, r*rh+3, cw-6, rh-6);
+            }
+            const tex = new THREE.CanvasTexture(c);
+            tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+            tex.repeat.set(2, 1);
+            return tex;
+        }
+        const windowTex = makeWindowTexture();
+
+        // ============================================================
+        // VILLE — InstancedMesh par lot de couleur + fenêtres à échelle
+        // correcte par instance (attribut instanceHeight + onBeforeCompile)
+        // ============================================================
+        const PALETTE = [0x707070, 0xcfc2a8, 0x5a6a78, 0x454b52];
+        const buildingData = [];
+        const raw = [];
+
+        const BUILDING_COUNT = 100;
+        let tries = 0;
+        while (raw.length < BUILDING_COUNT && tries < BUILDING_COUNT*4) {
+            tries++;
+            const x = rand(-100,100), z = rand(-100,100);
+            if (Math.hypot(x,z) < 14) continue;
+            raw.push({ x, z, h: rand(5,25) });
+        }
+
+        const buckets = PALETTE.map(color => ({ color, items: [] }));
+        raw.forEach((b,i) => buckets[i % buckets.length].items.push(b));
+
+        const WINDOW_DENSITY = 5/15;
+        const d = new THREE.Object3D();
+        buckets.forEach(bucket => {
+            if (bucket.items.length === 0) return;
+            const geo = new THREE.BoxGeometry(8,1,8);
+            const heights = new Float32Array(bucket.items.length);
+            bucket.items.forEach((b,i) => heights[i] = b.h);
+            geo.setAttribute('instanceHeight', new THREE.InstancedBufferAttribute(heights, 1));
+
+            const mat = new THREE.MeshLambertMaterial({ map: windowTex, color: bucket.color });
+            mat.onBeforeCompile = shader => {
+                shader.vertexShader = 'attribute float instanceHeight;\n' + shader.vertexShader;
+                shader.vertexShader = shader.vertexShader.replace(
+                    '#include <uv_vertex>',
+                    `#include <uv_vertex>
+                    #ifdef USE_UV
+                    vUv.y = uv.y * instanceHeight * ${WINDOW_DENSITY.toFixed(5)};
+                    #endif`
+                );
+            };
+
+            const mesh = new THREE.InstancedMesh(geo, mat, bucket.items.length);
+            bucket.items.forEach((b, i) => {
+                d.position.set(b.x, b.h/2, b.z);
+                d.scale.set(1, b.h, 1);
+                d.updateMatrix();
+                mesh.setMatrixAt(i, d.matrix);
+                buildingData.push({ x:b.x, z:b.z, hw:4, hd:4 });
+            });
+            scene.add(mesh);
+        });
+
+        function collidesBuilding(x, z, margin) {
+            for (const b of buildingData) {
+                if (Math.abs(x-b.x) < b.hw+margin && Math.abs(z-b.z) < b.hd+margin) return true;
+            }
+            return false;
+        }
+
+        function randomFreePoint(range, margin) {
+            for (let i=0; i<25; i++) {
+                const x = rand(-range,range), z = rand(-range,range);
+                if (Math.hypot(x,z) < 14) continue;
+                if (!collidesBuilding(x,z,margin)) return { x, z };
+            }
+            return { x: rand(-range,range), z: rand(-range,range) };
+        }
+
+        // --- Quelques arbres (touche "France"/parc urbain, sans reconstruire
+        // tout un système de districts pour rester dans le scope demandé) ---
+        function makeTree(x,z) {
+            const g = new THREE.Group();
+            const trunkH = rand(1.6,2.3);
+            const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.12,0.16,trunkH,7), new THREE.MeshLambertMaterial({color:0x5a4130}));
+            trunk.position.y = trunkH/2;
+            g.add(trunk);
+            const leaves = new THREE.Mesh(new THREE.SphereGeometry(rand(1.0,1.3),8,7), new THREE.MeshLambertMaterial({color:0x3d7a3d}));
+            leaves.position.y = trunkH+0.6;
+            leaves.scale.set(1,0.85,1);
+            g.add(leaves);
+            g.position.set(x,0,z);
+            scene.add(g);
+            buildingData.push({ x, z, hw:0.28, hd:0.28 });
+        }
+        for (let i=0;i<8;i++) {
+            const p = randomFreePoint(45, 0.4);
+            makeTree(p.x, p.z);
+        }
+
+        // ============================================================
+        // PERSONNAGE ARTICULÉ — réutilisé pour le joueur ET les PNJ
+        // (torse conique, bras/jambes à pivots, ombre blob)
+        // ============================================================
+        function makeHumanoid(opt) {
+            const skin = opt.skin ?? 0xe0b090;
+            const shirt = opt.shirt ?? 0x666666;
+            const pants = opt.pants ?? 0x2a2a2a;
+            const shoes = opt.shoes ?? 0x141414;
+
+            const matSkin = new THREE.MeshStandardMaterial({ color:skin, roughness:0.75 });
+            const matShirt = new THREE.MeshStandardMaterial({ color:shirt, roughness:0.6, metalness:0.05 });
+            const matPants = new THREE.MeshStandardMaterial({ color:pants, roughness:0.7 });
+            const matShoes = new THREE.MeshStandardMaterial({ color:shoes, roughness:0.5, metalness:0.1 });
+
+            const root = new THREE.Group();
+            const hip = new THREE.Group();
+            hip.position.y = 0.86;
+            root.add(hip);
+
+            const torso = new THREE.Mesh(new THREE.CylinderGeometry(0.22,0.16,0.5,10), matShirt);
+            torso.scale.set(1,1,0.66);
+            torso.position.y = 0.27;
+            hip.add(torso);
+            const shoulders = new THREE.Mesh(new THREE.SphereGeometry(0.24,10,8), matShirt);
+            shoulders.position.y = 0.5;
+            shoulders.scale.set(1,0.55,0.8);
+            hip.add(shoulders);
+
+            const neck = new THREE.Mesh(new THREE.CylinderGeometry(0.08,0.09,0.1,8), matSkin);
+            neck.position.y = 0.58;
+            hip.add(neck);
+            const head = new THREE.Mesh(new THREE.SphereGeometry(0.17,14,12), matSkin);
+            head.position.y = 0.78;
+            hip.add(head);
+            const hair = new THREE.Mesh(new THREE.SphereGeometry(0.175,10,8,0,Math.PI*2,0,Math.PI*0.55), new THREE.MeshStandardMaterial({color:0x2a1e16,roughness:0.8}));
+            hair.position.y = 0.815;
+            hip.add(hair);
+
+            if (opt.backpack) {
+                const pack = new THREE.Mesh(new THREE.BoxGeometry(0.3,0.36,0.16), new THREE.MeshStandardMaterial({color:opt.backpack, roughness:0.6}));
+                pack.position.set(0,0.3,-0.2);
+                hip.add(pack);
+            }
+
+            function makeArm(xSign) {
+                const shoulderPivot = new THREE.Group();
+                shoulderPivot.position.set(xSign*0.28, 0.5, 0);
+                hip.add(shoulderPivot);
+                const upper = new THREE.Mesh(new THREE.CylinderGeometry(0.065,0.06,0.3,8), matShirt);
+                upper.position.y = -0.15;
+                shoulderPivot.add(upper);
+                const elbowPivot = new THREE.Group();
+                elbowPivot.position.y = -0.3;
+                shoulderPivot.add(elbowPivot);
+                const lower = new THREE.Mesh(new THREE.CylinderGeometry(0.055,0.05,0.28,8), matSkin);
+                lower.position.y = -0.14;
+                elbowPivot.add(lower);
+                const hand = new THREE.Mesh(new THREE.SphereGeometry(0.06,8,8), matSkin);
+                hand.position.y = -0.28;
+                elbowPivot.add(hand);
+                return shoulderPivot;
+            }
+            const leftArm = makeArm(-1);
+            const rightArm = makeArm(1);
+
+            function makeLeg(xSign) {
+                const hipPivot = new THREE.Group();
+                hipPivot.position.set(xSign*0.13, 0, 0);
+                hip.add(hipPivot);
+                const upper = new THREE.Mesh(new THREE.CylinderGeometry(0.09,0.085,0.4,8), matPants);
+                upper.position.y = -0.2;
+                hipPivot.add(upper);
+                const kneePivot = new THREE.Group();
+                kneePivot.position.y = -0.4;
+                hipPivot.add(kneePivot);
+                const lower = new THREE.Mesh(new THREE.CylinderGeometry(0.08,0.07,0.38,8), matPants);
+                lower.position.y = -0.19;
+                kneePivot.add(lower);
+                const foot = new THREE.Mesh(new THREE.BoxGeometry(0.12,0.08,0.24), matShoes);
+                foot.position.set(0,-0.4,0.06);
+                kneePivot.add(foot);
+                return hipPivot;
+            }
+            const leftLeg = makeLeg(-1);
+            const rightLeg = makeLeg(1);
+
+            addBlobShadow(root, 0.42);
+
+            root.userData.parts = { leftArm, rightArm, leftLeg, rightLeg };
+            root.userData.walkPhase = Math.random()*Math.PI*2;
+            root.userData.lastPos = root.position.clone();
+            root.userData.fleeUntil = 0;
+            root.userData.fleeFrom = null;
+            return root;
+        }
+
+        function animateHumanoidWalk(root, dt, punching) {
+            const ud = root.userData;
+            const moved = root.position.distanceTo(ud.lastPos);
+            ud.lastPos.copy(root.position);
+            const spd = moved/Math.max(dt,0.0001);
+            const moving = spd > 0.4;
+            ud.walkPhase += dt*(moving?9:2.2);
+            const amp = moving?0.55:0.03;
+            const p = ud.parts;
+            p.leftLeg.rotation.x = Math.sin(ud.walkPhase)*amp;
+            p.rightLeg.rotation.x = -Math.sin(ud.walkPhase)*amp;
+            p.leftArm.rotation.x = -Math.sin(ud.walkPhase)*amp*0.8;
+            if (punching) {
+                const t = 1 - Math.max(0, punching);
+                p.rightArm.rotation.x = -1.8*Math.sin(Math.min(1,t)*Math.PI);
+            } else {
+                p.rightArm.rotation.x = Math.sin(ud.walkPhase)*amp*0.8;
+            }
+        }
+
+        // --- Joueur ---
+        const player = makeHumanoid({ skin:0xe8b48c, shirt:0x2f6fd6, pants:0x2b2f38, shoes:0x161616, backpack:0xd6432f });
+        player.position.set(0, 0, 3);
+        scene.add(player);
+
+        // --- PNJ ---
+        const PNJ_PALETTE = [
+            { skin:0xe8b48c, shirt:0xc98a3d, pants:0x4a4438 },
+            { skin:0x8a5a3c, shirt:0x3d7a5c, pants:0x2a2a2a },
+            { skin:0xf0c9a0, shirt:0xa03d4a, pants:0x30323a },
+            { skin:0x6b4530, shirt:0x4a4ea0, pants:0x1e1e22 },
+            { skin:0xd8a878, shirt:0x2f9e8f, pants:0x2b2f38 }
+        ];
+        const pnj = [];
+        for (let i=0; i<15; i++) {
+            const m = makeHumanoid(Object.assign({ shoes:0x1c1c1c }, PNJ_PALETTE[i % PNJ_PALETTE.length]));
+            const p = randomFreePoint(30, 1);
+            m.position.set(p.x, 0, p.z);
+            scene.add(m); pnj.push(m);
+        }
+
+        // ============================================================
+        // VÉHICULE
+        // ============================================================
+        function makeCarMesh() {
+            const g = new THREE.Group();
+            const body = new THREE.Mesh(new THREE.BoxGeometry(2, 0.7, 4), new THREE.MeshLambertMaterial({ color:0xd6432f }));
+            body.position.y = 0.45;
+            g.add(body);
+            const cabin = new THREE.Mesh(new THREE.BoxGeometry(1.6, 0.5, 2.2), new THREE.MeshLambertMaterial({ color:0x20242b }));
+            cabin.position.set(0, 0.95, -0.2);
+            g.add(cabin);
+            const wheelMat = new THREE.MeshLambertMaterial({ color:0x111111 });
+            const wheelGeo = new THREE.CylinderGeometry(0.32, 0.32, 0.25, 12);
+            [[-1,1.3],[1,1.3],[-1,-1.3],[1,-1.3]].forEach(([sx,sz]) => {
+                const w = new THREE.Mesh(wheelGeo, wheelMat);
+                w.rotation.z = Math.PI/2;
+                w.position.set(sx*1.05, 0.32, sz);
+                g.add(w);
+            });
+            addBlobShadow(g, 0.55);
+            return g;
+        }
+        const car = makeCarMesh();
+        car.position.set(3, 0, -2);
+        scene.add(car);
+
+        // ============================================================
+        // OBJETS INTERACTIBLES (touche ■)
+        // ============================================================
+        function makePickup(x, z, reward) {
+            const g = new THREE.Group();
+            const ring = new THREE.Mesh(new THREE.TorusGeometry(0.5,0.07,8,20), new THREE.MeshBasicMaterial({ color:0xf2c94c }));
+            ring.rotation.x = Math.PI/2; ring.position.y = 0.06;
+            g.add(ring);
+            const core = new THREE.Mesh(new THREE.IcosahedronGeometry(0.24,0), new THREE.MeshStandardMaterial({ color:0xf2c94c, emissive:0xffcc55, emissiveIntensity:0.55, roughness:0.3 }));
+            core.position.y = 0.85;
+            g.add(core);
+            g.position.set(x, 0, z);
+            scene.add(g);
+            return { mesh:g, reward, active:true, spinPhase: Math.random()*Math.PI*2 };
+        }
+        const interactables = [];
+        for (let i=0; i<3; i++) {
+            const p = randomFreePoint(38, 1);
+            interactables.push(makePickup(p.x, p.z, Math.round(rand(15,30))));
+        }
+
+        // ============================================================
+        // ÉTAT DE JEU
+        // ============================================================
+        let money = 0;
+        let isDriving = false;
+        let playerHeading = 0;
+        let isAirborne = false, jumpVel = 0;
+        const GRAVITY = 22, JUMP_IMPULSE = 7.2;
+        let punchAnimUntil = 0, punchCooldownUntil = 0;
+
+        let speed = 0;
+        let heading = 0;
+        const MAX_SPEED = 14, REVERSE_MAX = 7, ACCEL = 9, BRAKE = 16, FRICTION = 0.35, TURN_RATE = 1.8;
+        const PLAYER_SPEED = 6.4;
+
+        // ============================================================
+        // ENTRÉES — 1 joystick réutilisé (marche ou conduite selon le
+        // mode) + 4 boutons contextuels
+        // ============================================================
+        const driveVec = { x:0, y:0 };
+        function makeDriveStick(baseId, stickId, vecOut) {
+            const base = document.getElementById(baseId);
+            const stick = document.getElementById(stickId);
+            let maxR = 40, activeId = null;
+            function setFromClient(clientX, clientY) {
+                const rect = base.getBoundingClientRect();
+                const cx = rect.left + rect.width/2, cy = rect.top + rect.height/2;
+                let dx = clientX-cx, dy = clientY-cy;
+                const dist = Math.hypot(dx,dy);
+                if (dist > maxR) { dx = dx/dist*maxR; dy = dy/dist*maxR; }
+                stick.style.transform = `translate(${dx}px, ${dy}px)`;
+                vecOut.x = dx/maxR; vecOut.y = dy/maxR;
+            }
+            function reset() {
+                activeId = null; vecOut.x = 0; vecOut.y = 0;
+                stick.style.transform = 'translate(0px, 0px)';
+            }
+            base.addEventListener('pointerdown', e => {
+                e.preventDefault();
+                maxR = base.clientWidth/2 - stick.clientWidth/2;
+                activeId = e.pointerId;
+                base.setPointerCapture(e.pointerId);
+                setFromClient(e.clientX, e.clientY);
+            });
+            base.addEventListener('pointermove', e => {
+                if (e.pointerId !== activeId) return;
+                e.preventDefault();
+                setFromClient(e.clientX, e.clientY);
+            });
+            base.addEventListener('pointerup', e => { if (e.pointerId === activeId) reset(); });
+            base.addEventListener('pointercancel', e => { if (e.pointerId === activeId) reset(); });
+        }
+        makeDriveStick('driveJoyBase', 'driveJoyStick', driveVec);
+
+        const heldBtn = { jump:false, interact:false, action:false, vehicle:false };
+        const prevBtn = { jump:false, interact:false, action:false, vehicle:false };
+        function bindBtn(id, flag) {
+            const el = document.getElementById(id);
+            const on  = e => { if (e) e.preventDefault(); heldBtn[flag] = true;  el.classList.add('active'); };
+            const off = e => { if (e) e.preventDefault(); heldBtn[flag] = false; el.classList.remove('active'); };
+            el.addEventListener('touchstart', on, { passive:false });
+            el.addEventListener('touchend', off, { passive:false });
+            el.addEventListener('touchcancel', off, { passive:false });
+            el.addEventListener('mousedown', on);
+            el.addEventListener('mouseup', off);
+            el.addEventListener('mouseleave', off);
+        }
+        bindBtn('tri', 'jump');
+        bindBtn('carre', 'interact');
+        bindBtn('rond', 'action');
+        bindBtn('croix', 'vehicle');
+
+        function computeEdges() {
+            const e = {};
+            for (const k in heldBtn) e[k] = heldBtn[k] && !prevBtn[k];
+            for (const k in heldBtn) prevBtn[k] = heldBtn[k];
+            return e;
+        }
+
+        // ============================================================
+        // VÉHICULE — monter / descendre
+        // ============================================================
+        function enterVehicle() {
+            isDriving = true;
+            player.visible = false;
+            speed = 0;
+            document.getElementById('tri').style.display = 'none';
+            document.getElementById('carre').style.display = 'none';
+            document.getElementById('hint').textContent = 'Joystick — direction & accélérateur (haut=avance, bas=recule) · ● frein · ✖ descendre';
+        }
+        function exitVehicle() {
+            isDriving = false;
+            const off = new THREE.Vector3(Math.cos(heading)*1.8, 0, -Math.sin(heading)*1.8);
+            player.position.set(car.position.x+off.x, 0, car.position.z+off.z);
+            playerHeading = heading;
+            player.rotation.y = playerHeading;
+            player.visible = true;
+            speed = 0;
+            document.getElementById('tri').style.display = 'flex';
+            document.getElementById('carre').style.display = 'flex';
+            document.getElementById('hint').textContent = 'Joystick — déplacement · ▲ sauter · ■ interagir · ● frapper · ✖ monter en véhicule';
+        }
+        function tryEnterVehicle() {
+            if (player.position.distanceTo(car.position) < 3.2) enterVehicle();
+        }
+
+        // ============================================================
+        // ACTIONS À PIED
+        // ============================================================
+        function tryJump() {
+            if (!isAirborne) { jumpVel = JUMP_IMPULSE; isAirborne = true; }
+        }
+        function tryInteract() {
+            for (const it of interactables) {
+                if (!it.active) continue;
+                if (player.position.distanceTo(it.mesh.position) < 2.0) {
+                    it.active = false;
+                    it.mesh.visible = false;
+                    money += it.reward;
+                    setTimeout(() => { it.active = true; it.mesh.visible = true; }, 8000);
+                    return;
+                }
+            }
+        }
+        function tryPunch() {
+            const now = performance.now()/1000;
+            if (now < punchCooldownUntil) return;
+            punchCooldownUntil = now + 0.45;
+            punchAnimUntil = now + 0.25;
+            let nearest = null, nd = 1.6;
+            pnj.forEach(p => {
+                const dist = player.position.distanceTo(p.position);
+                if (dist < nd) { nd = dist; nearest = p; }
+            });
+            if (nearest) {
+                nearest.userData.fleeUntil = now + 2.2;
+                nearest.userData.fleeFrom = player.position.clone();
+            }
+        }
+
+        // ============================================================
+        // PHYSIQUE VOITURE (inchangée) — pilotée au joystick + frein ●
+        // ============================================================
+        function updateCar(dt) {
+            const throttle = -driveVec.y;
+            const steer = driveVec.x;
+            const DEADZONE = 0.12;
+
+            if (heldBtn.action) {
+                if (speed > 0) speed = Math.max(0, speed - BRAKE*dt);
+                else if (speed < 0) speed = Math.min(0, speed + BRAKE*dt);
+            } else if (throttle > DEADZONE) {
+                speed = Math.min(MAX_SPEED, speed + ACCEL*dt*throttle);
+            } else if (throttle < -DEADZONE) {
+                speed = Math.max(-REVERSE_MAX, speed - ACCEL*dt*Math.abs(throttle));
+            } else if (speed > 0) {
+                speed = Math.max(0, speed - FRICTION*MAX_SPEED*dt);
+            } else if (speed < 0) {
+                speed = Math.min(0, speed + FRICTION*MAX_SPEED*dt);
+            }
+
+            if (Math.abs(steer) > DEADZONE) {
+                heading -= steer*TURN_RATE*dt*(0.3+Math.abs(speed)/MAX_SPEED*0.7);
+            }
+            car.rotation.y = heading;
+
+            const nx = car.position.x + Math.sin(heading)*speed*dt;
+            const nz = car.position.z + Math.cos(heading)*speed*dt;
+            const CAR_MARGIN = 1.3;
+            if (!collidesBuilding(nx, car.position.z, CAR_MARGIN)) car.position.x = nx; else speed *= 0.4;
+            if (!collidesBuilding(car.position.x, nz, CAR_MARGIN)) car.position.z = nz; else speed *= 0.4;
+        }
+
+        // ============================================================
+        // MARCHE À PIED — même joystick, interprété différemment
+        // ============================================================
+        function updatePlayerWalk(dt) {
+            const mag = Math.hypot(driveVec.x, driveVec.y);
+            if (mag > 0.12) {
+                const fx = driveVec.x, fz = -driveVec.y;
+                const len = Math.hypot(fx,fz) || 1;
+                const nx0 = fx/len, nz0 = fz/len;
+                playerHeading = Math.atan2(nx0, nz0);
+                player.rotation.y = playerHeading;
+                const nx = player.position.x + nx0*PLAYER_SPEED*dt;
+                const nz = player.position.z + nz0*PLAYER_SPEED*dt;
+                const MARGIN = 0.32;
+                if (!collidesBuilding(nx, player.position.z, MARGIN)) player.position.x = nx;
+                if (!collidesBuilding(player.position.x, nz, MARGIN)) player.position.z = nz;
+            }
+            if (isAirborne) {
+                jumpVel -= GRAVITY*dt;
+                player.position.y += jumpVel*dt;
+                if (player.position.y <= 0) { player.position.y = 0; isAirborne = false; jumpVel = 0; }
+            }
+        }
+
+        // ============================================================
+        // PNJ — fuient la voiture (en conduite) ou un coup de poing reçu
+        // ============================================================
+        function updatePNJ(dt, now) {
+            const FLEE_RADIUS_CAR = 8, FLEE_SPEED = 4;
+            pnj.forEach(p => {
+                let source = null;
+                if (isDriving && p.position.distanceTo(car.position) < FLEE_RADIUS_CAR) source = car.position;
+                if (p.userData.fleeUntil > now && p.userData.fleeFrom) source = p.userData.fleeFrom;
+                if (!source) return;
+                const dx = p.position.x-source.x, dz = p.position.z-source.z;
+                const dist = Math.hypot(dx,dz);
+                if (dist < 0.01) return;
+                const nx = p.position.x + (dx/dist)*FLEE_SPEED*dt;
+                const nz = p.position.z + (dz/dist)*FLEE_SPEED*dt;
+                if (!collidesBuilding(nx, p.position.z, 0.4)) p.position.x = nx;
+                if (!collidesBuilding(p.position.x, nz, 0.4)) p.position.z = nz;
+                p.rotation.y = Math.atan2(dx, dz);
+            });
+        }
+
+        // ============================================================
+        // CAMÉRAS (framerate-indépendantes, même formule pour les 2 modes)
+        // ============================================================
+        function updateCarCamera(dt) {
+            const behind = new THREE.Vector3(Math.sin(heading)*-10, 6, Math.cos(heading)*-10);
+            const desired = car.position.clone().add(behind);
+            camera.position.lerp(desired, 1 - Math.pow(0.001, dt));
+            camera.lookAt(car.position.x, car.position.y+1, car.position.z);
+        }
+        function updateWalkCamera(dt) {
+            const behind = new THREE.Vector3(Math.sin(playerHeading)*-7.5, 4, Math.cos(playerHeading)*-7.5);
+            const desired = player.position.clone().add(behind);
+            camera.position.lerp(desired, 1 - Math.pow(0.0015, dt));
+            camera.lookAt(player.position.x, player.position.y+1.3, player.position.z);
+        }
+
+        // ============================================================
+        // PROMPT & HUD
+        // ============================================================
+        function updatePrompt() {
+            const el = document.getElementById('prompt');
+            let text = null;
+            if (!isDriving) {
+                if (player.position.distanceTo(car.position) < 3.2) {
+                    text = 'Approche-toi de la voiture et appuie sur ✖ pour monter';
+                } else {
+                    for (const it of interactables) {
+                        if (it.active && player.position.distanceTo(it.mesh.position) < 2.5) {
+                            text = 'Appuie sur ■ pour interagir';
+                            break;
+                        }
+                    }
+                }
+            }
+            if (text) { el.style.display = 'block'; el.textContent = text; }
+            else { el.style.display = 'none'; }
+        }
+        function updateHUD() {
+            document.getElementById('moneyval').textContent = money;
+        }
+
+        // ============================================================
+        // BOUCLE PRINCIPALE
+        // ============================================================
+        function animate() {
+            requestAnimationFrame(animate);
+            const dt = Math.min(clock.getDelta(), 0.05);
+            const now = performance.now()/1000;
+            const edge = computeEdges();
+
+            if (isDriving) {
+                if (edge.vehicle) exitVehicle();
+                updateCar(dt);
+            } else {
+                if (edge.jump) tryJump();
+                if (edge.interact) tryInteract();
+                if (edge.action) tryPunch();
+                if (edge.vehicle) tryEnterVehicle();
+                updatePlayerWalk(dt);
+            }
+
+            updatePNJ(dt, now);
+
+            if (isDriving) updateCarCamera(dt); else updateWalkCamera(dt);
+
+            if (!isDriving) {
+                const punchT = now < punchAnimUntil ? (punchAnimUntil-now)/0.25 : 0;
+                animateHumanoidWalk(player, dt, punchT > 0 ? punchT : false);
+            }
+            pnj.forEach(p => animateHumanoidWalk(p, dt, false));
+
+            interactables.forEach(it => {
+                if (it.active) { it.spinPhase += dt*1.5; it.mesh.rotation.y = it.spinPhase; }
+            });
+
+            updatePrompt();
+            updateHUD();
+
+            renderer.render(scene, camera);
+        }
+        animate();
+    </script>
+</body>
+</html>
